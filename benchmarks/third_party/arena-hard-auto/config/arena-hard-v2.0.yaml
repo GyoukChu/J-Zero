@@ -1,0 +1,31 @@
+# LOCAL judge config for Auto-Arena-Hard-v2.0 (local-only eval, ZERO external API).
+#
+# PER-CATEGORY JUDGE ROUTING (see utils/judge_utils.py -> JUDGE_SETTINGS):
+#   hard_prompt      -> qwen36-judge   (Qwen3.6-27B, no-thinking)   vs o3-mini-2025-01-31
+#   creative_writing -> gemma4-judge   (google/gemma-4-31b-it)      vs gemini-2.0-flash-001
+# gen_judgment.py routes each question to its category's judge and writes the
+# judgment under data/arena-hard-v2.0/model_judgment/<judge>/. show_result.py
+# scores each category from that category's judge dir automatically.
+#
+# `judge_model` below is only a FALLBACK, used for any category that does not
+# declare a `judge` in JUDGE_SETTINGS. Endpoints for both judges live in
+# config/api_config.yaml (ports rewritten per run by run_eval.sh).
+# api_type: openai with a local api_base => fully local, ZERO external API calls.
+judge_model: gemma4-judge
+temperature: 0.0
+max_tokens: 4096
+
+bench_name: arena-hard-v2.0
+
+reference: null
+
+regex_patterns:
+  - \[\[([AB<>=]+)\]\]
+  - \[([AB<>=]+)\]
+
+prompt_template: "<|User Prompt|>\n{QUESTION}\n\n<|The Start of Assistant A's Answer|>\n{ANSWER_A}\n<|The End of Assistant A's Answer|>\n\n<|The Start of Assistant B's Answer|>\n{ANSWER_B}\n<|The End of Assistant B's Answer|>"
+
+# model_list is rewritten per-run by run_eval.sh to the single slug under test.
+model_list:
+  - example-model
+   # rewritten per run by run_eval.sh

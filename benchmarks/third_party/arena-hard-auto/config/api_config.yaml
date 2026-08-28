@@ -1,0 +1,115 @@
+# Arena-Hard-v2.0 judges. REWRITTEN BY run_eval.sh ON EVERY RUN:
+#   qwen36-judge (hard_prompt)      -> the 2 Qwen3.6-27B ports
+#   gemma4-judge (creative_writing) -> the 1 gemma-4-31b-it port
+# plus one entry per evaluated slug, appended and kept. Edits and
+# comments below this header do not survive a run.
+qwen36-judge:
+  model: qwen36-judge
+  endpoints:
+  - api_base: http://127.0.0.1:7430/v1
+    api_key: '-'
+  - api_base: http://127.0.0.1:7431/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+gemma4-judge:
+  model: gemma4-judge
+  endpoints:
+  - api_base: http://127.0.0.1:7432/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+ours_iter1:
+  model: eval-ours-iter1
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+ours_iter2:
+  model: eval-ours-iter2
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+ours_iter3:
+  model: eval-ours-iter3
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+ours_iter4:
+  model: eval-ours-iter4
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+ours_iter5:
+  model: eval-ours-iter5
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+rzero_iter1:
+  model: eval-rzero-iter1
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+rzero_iter2:
+  model: eval-rzero-iter2
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+rzero_iter3:
+  model: eval-rzero-iter3
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+rzero_iter4:
+  model: eval-rzero-iter4
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0
+rzero_iter5:
+  model: eval-rzero-iter5
+  endpoints:
+  - api_base: http://127.0.0.1:7451/v1
+    api_key: '-'
+  api_type: openai
+  parallel: 48
+  max_tokens: 4096
+  temperature: 0.0

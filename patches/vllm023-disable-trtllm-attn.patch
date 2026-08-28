@@ -1,0 +1,38 @@
+Opt-in kill switch for vLLM 0.23's TRTLLM-gen attention on SM100 (B200-class):
+a colocated rollout EngineCore can futex-deadlock on idle/resume when TRTLLM
+attention is active. No behavior change unless VLLM_DISABLE_TRTLLM_ATTN=1.
+
+SCOPE: vLLM 0.23 environments only. The hunk is generated against 0.23's
+vllm/utils/flashinfer.py and does NOT apply to vLLM 0.11, and stock vLLM (any
+version) never reads VLLM_DISABLE_TRTLLM_ATTN at all — the variable only does
+something once this patch is applied. So exporting it in the vLLM 0.11 training
+env has no effect, and no equivalent patch is shipped for 0.11.
+
+NOTE: the comment text inside the added block was corrected after this patch
+shipped. A venv patched with the ORIGINAL file cannot be reverse-applied with
+this one (the reverse hunk no longer matches the applied bytes) — retrieve the
+original with `git show c1ad157:patches/vllm023-disable-trtllm-attn.patch`, or
+just delete the [J-Zero patch] block by hand. Applied behavior is identical.
+
+Apply:  cd <venv>/lib/python3.12/site-packages && patch -p1 < this-file
+Revert: cd <venv>/lib/python3.12/site-packages && patch -R -p1 < this-file
+
+--- a/vllm/utils/flashinfer.py
++++ b/vllm/utils/flashinfer.py
+@@ -357,6 +357,16 @@
+     if envs.VLLM_BATCH_INVARIANT:
+         return False
+ 
++    # [J-Zero patch] Opt-in kill switch for the TRTLLM-gen attention backend.
++    # A colocated rollout EngineCore can futex-deadlock on idle/resume during
++    # the reward stage (~30s pauses) when TRTLLM attention is active on SM100.
++    # Standard FlashInfer attention is stable. This patch is for vLLM 0.23
++    # only. Default behavior is UNCHANGED (TRTLLM on) unless
++    # VLLM_DISABLE_TRTLLM_ATTN=1. Revert: re-apply in reverse (patch -R -p1).
++    import os as _os
++    if _os.environ.get("VLLM_DISABLE_TRTLLM_ATTN", "0") == "1":
++        return False
++
+     # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
+     return (
+         current_platform.is_device_capability_family(100) and has_nvidia_artifactory()
