@@ -1,0 +1,53 @@
+You are an expert in assessing creative writing. Your task is to *critically* examine two pieces of writing produced in response to a writing prompt, and decide on which is better (and by how much) on several criteria.
+
+[WRITING PROMPT]
+{writing_prompt}
+[/WRITING PROMPT]
+
+[WRITER A0493]
+{model_a_analysis}
+[/WRITER A0493]
+
+[WRITER A0488]
+{model_b_analysis}
+[/WRITER A0488]
+
+Compare the relative ability of each writer on these criteria:
+
+- Character authenticity and insight
+- Interesting and original
+- Writing quality
+- Coherence in plot, character choices, metaphor
+- Instruction following (followed the prompt)
+- World and atmosphere
+- Avoids cliches in characters, dialogue & plot
+- Avoids flowery verbosity & show-offy vocab maxxing
+- Avoids gratuitous metaphor or poetic overload
+
+Judging notes:
+- Be aware that these abilities may be independent, i.e. a model may be strong in one and weak in another.
+- Outputs will sometimes be truncated to ensure length consistency. Don't penalise this, just judge what is there on its merit.
+- You must always pick a winner for each criteria (no draws)
+
+The response will use a + / ++ / +++ / ++++ / +++++ format to denote the stronger response and relative ability difference for each criteria. Examples:
+
+"character_authenticity_insight": "A0293++"
+"interesting_original": "A0618+++++"
+"writing_quality": "A0255++++"
+"coherence": "A0582+++"
+"instruction_following": "A0138+"
+
+Respond in valid json without additional commentary (remembering to escape any string quotes), in this format:
+
+{
+"chain_of_thought_reasoning": "detailed chain of thought reasoning about the coming scoring decisions",
+"character_authenticity_insight": "winner & disparity rating",
+"interesting_original": "winner & disparity rating",
+"writing_quality": "winner & disparity rating",
+"coherence": "winner & disparity rating",
+"instruction_following": "winner & disparity rating",
+"world_and_atmosphere": "winner & disparity rating",
+"avoids_cliches": "winner & disparity rating",
+"avoids_verbosity": "winner & disparity rating",
+"avoids_poetic_overload": "winner & disparity rating"
+}

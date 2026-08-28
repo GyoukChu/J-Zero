@@ -1,0 +1,15 @@
+diff --git a/src/alpaca_eval/annotators/pairwise_evaluator.py b/src/alpaca_eval/annotators/pairwise_evaluator.py
+index 817f5fe..05199a1 100644
+--- a/src/alpaca_eval/annotators/pairwise_evaluator.py
++++ b/src/alpaca_eval/annotators/pairwise_evaluator.py
+@@ -304,6 +304,10 @@ class PairwiseAnnotatorLocal(BaseAnnotator):
+ 
+         # 2. deals with equality
+         idcs_is_same_outputs = df_to_annotate["output_1"] == df_to_annotate["output_2"]
++        # pandas>=3.0 raises when assigning a float (1.5) into a column inferred
++        # as int64; ensure the annotation column is float before the assignment.
++        if self.annotation_key in df_to_annotate.columns:
++            df_to_annotate[self.annotation_key] = df_to_annotate[self.annotation_key].astype("float64")
+         df_to_annotate.loc[idcs_is_same_outputs, self.annotation_key] = 1.5
+         # for backward compatibility 0 used to mean same output => replace with 1.5
+         df_to_annotate[self.annotation_key] = df_to_annotate[self.annotation_key].replace({0: 1.5})

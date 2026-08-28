@@ -1,0 +1,392 @@
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+index 58b7148c..ed349508 100644
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -90,23 +90,63 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
+ def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple[str, str]:
+     addr = ray.util.get_node_ip_address().strip("[]")
+ 
++    # [J-Zero patch] The stock bind(("", 0)) returns whatever the
++    # OS hands out from the ephemeral port pool, which is roughly sequential and
++    # therefore tends to give back the *same* port across consecutive phases
++    # (e.g. after a previous vLLM/ray cluster was torn down). That collides
++    # with stale TCPStore-style listeners (or with vLLM EngineCore's own ephemeral
++    # IPC ports) and yields:
++    #   - rank=0  EADDRINUSE on the rendezvous TCPStore listen
++    #   - rank=1  "nonce == returnedNonce" because it pings the stranger that
++    #             happens to hold the same port
++    # Both modes are unrecoverable inside the worker (the MASTER_PORT env was
++    # baked in at actor spawn). We mitigate by:
++    #   (1) defaulting to an upper-end range (55000-65000) so we don't fight
++    #       the ephemeral pool that vLLM/ray itself uses for child IPC.
++    #   (2) probing a *randomised* sequence of ports inside the range and doing
++    #       a real bind+listen test so we drop the port only if it's truly free.
++    #   (3) honoring an env override (VERL_MASTER_PORT_RANGE) so the launch
++    #       script can force a different range without code changes.
++    import random as _rng
++
+     if master_port_range is None:
+-        with socket.socket() as s:
+-            s.bind(("", 0))
+-            port = s.getsockname()[1]
+-    else:
+-        port = master_port_range[0]
+-        while port < master_port_range[1]:
++        env_range = os.environ.get("VERL_MASTER_PORT_RANGE", "")
++        if env_range:
+             try:
+-                with socket.socket() as s:
+-                    s.bind(("", port))
+-                    break
+-            except OSError:
+-                port += 1  # Increment port number if already in use
+-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
+-        else:
+-            raise RuntimeError(f"Could not find a free port in range {master_port_range}")
+-    return addr, str(port)
++                lo_str, hi_str = env_range.split("-", 1)
++                master_port_range = [int(lo_str), int(hi_str)]
++            except (ValueError, AttributeError):
++                logger.warning(
++                    "Ignoring malformed VERL_MASTER_PORT_RANGE=%r (expected 'LO-HI')",
++                    env_range,
++                )
++                master_port_range = None
++        if master_port_range is None:
++            master_port_range = [55000, 65000]
++
++    lo, hi = master_port_range[0], master_port_range[1]
++    if hi <= lo:
++        raise RuntimeError(f"Invalid master_port_range {master_port_range}: hi must be > lo")
++
++    candidates = list(range(lo, hi))
++    _rng.shuffle(candidates)
++    last_err = None
++    for port in candidates:
++        try:
++            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
++                # Avoid SO_REUSEADDR so we genuinely detect another LISTEN on
++                # this port (SO_REUSEADDR would let us steal a TIME_WAIT slot
++                # only to have the TCPStore fight it later).
++                s.bind(("", port))
++                s.listen(1)
++            return addr, str(port)
++        except OSError as e:
++            last_err = e
++            continue
++    raise RuntimeError(
++        f"Could not find a free port in range {master_port_range} after "
++        f"{len(candidates)} attempts; last error: {last_err}"
++    )
+ 
+ 
+ class RayResourcePool(ResourcePool):
+diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
+index 8f6cd416..199cb40c 100644
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -312,7 +312,129 @@ class TaskRunner:
+         trainer.init_workers()
+ 
+         # Start the training process.
+-        trainer.fit()
++        _fit_failed = True
++        try:
++            trainer.fit()
++            _fit_failed = False
++        finally:
++            # [J-Zero patch] Close the wandb run HERE, from the thread that ran
++            # training, instead of leaving it to Tracking.__del__. __del__ runs
++            # while this ray actor's interpreter is shutting down, by which
++            # point the collection happens on wandb's own asyncio-manager
++            # thread — and wandb's run() refuses to be called from that thread.
++            # So every stage ended a *successful*, checkpoint-saved run with
++            #   Exception ignored in: <function Tracking.__del__ ...>
++            #     File ".../wandb/sdk/lib/asyncio_manager.py", line 132, in run
++            #   ValueError: Cannot use run() inside async loop.
++            # plus BrokenPipeError / closed-UnixTransport follow-ups, which
++            # makes a long multi-round run impossible to judge from its log.
++            # Finishing early also flushes the run before ray tears the actor
++            # down. wandb.finish() is a no-op when no run is active, so a
++            # Tracking.__del__ that fires after this point is harmless.
++            # This does NOT catch every case: a Tracking collected while fit()
++            # is still running is out of reach of a finally that runs after it,
++            # and the solver stage has been observed to emit one such traceback
++            # on an otherwise clean run. Teardown noise must never mask a real
++            # training exception: swallow anything raised.
++            #
++            # exit_code is passed explicitly. wandb's own default is None, and
++            # Run._atexit_cleanup resolves `exit_code or ... or 0`, so finishing
++            # a crashed stage without it would file the run as SUCCEEDED — a
++            # green dashboard for a stage that raised, which is worse than the
++            # traceback this patch removes.
++            try:
++                import threading
++
++                import wandb
++
++                _exit_code = 1 if _fit_failed else 0
++
++                def _wandb_shutdown():
++                    # Swallow here, NOT in the caller: this body runs on another
++                    # thread, so an escaping exception is printed by
++                    # threading.excepthook as a full traceback — reintroducing
++                    # exactly the teardown noise this patch exists to remove.
++                    try:
++                        if wandb.run is not None:
++                            wandb.finish(exit_code=_exit_code)
++                        # finish() ends the run but leaves wandb's service process
++                        # and its atexit hook alive. That hook
++                        # (service_connection.py teardown_atexit) then runs during
++                        # interpreter shutdown and ends a *successful* stage with
++                        #   Exception ignored in atexit callback: <... teardown_atexit>
++                        #   ...  await self._writer.wait_closed()
++                        #   BrokenPipeError: [Errno 32] Broken pipe
++                        # teardown() does the same work now, while the interpreter
++                        # is healthy, and its ServiceConnection.teardown() calls
++                        # the cleanup that atexit.unregister()s the hook, so
++                        # nothing is left to fire later.
++                        wandb.teardown(exit_code=_exit_code)
++                    except Exception as e:  # noqa: BLE001
++                        print(f"[verl main_ppo] wandb shutdown failed (ignored): {e}", flush=True)
++
++                # [J-Zero patch] Bound the teardown so an unreachable wandb
++                # backend cannot hang every stage with the GPUs idle, silently
++                # stalling a long launcher.
++                #
++                # The PRIMARY bound is wandb's own `finish_timeout`, exported as
++                # WANDB_FINISH_TIMEOUT by env_prelude.sh. It stops the upload wait
++                # in-process, leaves the data on disk for the `wandb sync` the
++                # stage scripts already run, and marks the run Crashed rather than
++                # leaving it silently truncated.
++                #
++                # The thread below is only a belt-and-braces OUTER bound, for
++                # hangs finish_timeout does not cover (e.g. a stuck service
++                # handshake). Reaching it is a degraded path — see the message.
++                _tmo = float(os.environ.get("JZERO_WANDB_SHUTDOWN_TIMEOUT", "120"))
++                _t = threading.Thread(target=_wandb_shutdown, daemon=True)
++                _t.start()
++                _t.join(_tmo)
++                if _t.is_alive():
++                    print(
++                        f"[verl main_ppo] wandb shutdown still running after {_tmo:.0f}s; "
++                        "abandoning it. The run may stay 'running' in wandb, a "
++                        "Tracking.__del__ and/or atexit BrokenPipeError traceback may "
++                        "follow at exit, and the metrics tail may be missing. Training "
++                        "and checkpoints are unaffected; `wandb sync` can still upload "
++                        "the on-disk run data.",
++                        flush=True,
++                    )
++            except Exception as e:  # noqa: BLE001
++                print(f"[verl main_ppo] wandb shutdown thread failed (ignored): {e}", flush=True)
++
++            # [J-Zero patch] Quiesce the DataLoader workers for the same reason.
++            # ray_trainer.py builds the train/val StatefulDataLoaders with
++            # data.dataloader_num_workers (default 8), and torch arms a SIGCHLD
++            # handler that turns any worker death into an exception
++            # (torch/utils/data/_utils/signal_handling.py). Once fit() has
++            # returned the workers are only being torn down, but the handler is
++            # still armed, so the reap surfaced as
++            #     File ".../_utils/signal_handling.py", line 73, in handler
++            #       _error_if_any_worker_fails()
++            #   RuntimeError: DataLoader worker (pid ...) is killed by signal: Killed.
++            # raised straight through ray's run_task_loop on a *successful*,
++            # checkpoint-saved stage. Drop the iterators and collect so the
++            # workers exit while the interpreter is still healthy, then disarm
++            # the handler so a late or forced reap stays silent. This runs only
++            # after fit() has returned or raised, so it cannot hide a worker
++            # failure that mattered to training. signal.signal() is valid here
++            # because torch armed the handler from this same (main) thread.
++            try:
++                import gc as _gc
++                import signal as _signal
++
++                from torch.utils.data._utils import signal_handling as _sig
++
++                for _name in ("train_dataloader", "val_dataloader"):
++                    _dl = getattr(trainer, _name, None)
++                    if _dl is not None and getattr(_dl, "_iterator", None) is not None:
++                        _dl._iterator = None
++                _gc.collect()
++                if getattr(_sig, "_SIGCHLD_handler_set", False):
++                    _signal.signal(_signal.SIGCHLD, _signal.SIG_DFL)
++                    _sig._SIGCHLD_handler_set = False
++            except Exception as e:  # noqa: BLE001
++                print(f"[verl main_ppo] dataloader quiesce failed (ignored): {e}", flush=True)
+ 
+ 
+ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index d1eaa7bd..0e494566 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -256,7 +256,9 @@ def compute_advantage(
+         if "reward_baselines" in data.batch:  # optional
+             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+         # GDPO: pass raw data for per-dimension reward extraction
+-        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
++        # grpo_segmented:
++        # same need — token-level segment_mask + R_q/R_r live in batch/non_tensor_batch.
++        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo", "grpo_segmented"):
+             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+             adv_kwargs["batch"] = data.batch
+         # Add sum_pi_squared for Optimal Token Baseline
+diff --git a/verl/utils/distributed.py b/verl/utils/distributed.py
+index b0274452..b71f7455 100644
+--- a/verl/utils/distributed.py
++++ b/verl/utils/distributed.py
+@@ -80,6 +80,8 @@ def destroy_global_process_group():
+ def initialize_global_process_group_ray(timeout_second=None, backend=None):
+     # in current ray environment, LOCAL_RANK is always zero.
+ 
++    import time
++
+     import torch.distributed
+ 
+     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
+@@ -87,13 +89,60 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
+     if not torch.distributed.is_initialized():
+         rank = int(os.environ.get("RANK", 0))
+         world_size = int(os.environ.get("WORLD_SIZE", 1))
+-        torch.distributed.init_process_group(
+-            backend=backend,
+-            rank=rank,
+-            world_size=world_size,
+-            timeout=timeout,
+-            init_method=os.environ.get("DIST_INIT_METHOD", None),
+-        )
++        init_method = os.environ.get("DIST_INIT_METHOD", None)
++
++        # [J-Zero patch] When ray launches many
++        # actors concurrently after a previous phase's vLLM workers have been
++        # pkilled, the MASTER_PORT picked by ray.get_master_addr_port can
++        # transiently collide with a stale TCPStore listener (TIME_WAIT or a
++        # ray-internal port grab), yielding "RuntimeError: nonce == returnedNonce"
++        # on the client TCPStore ping or "EADDRINUSE" on the rank-0 listen.
++        #
++        # NB: retrying inside the worker cannot change MASTER_PORT (already
++        # baked into the actor's environment at spawn time), so retrying only
++        # buys time for the stale listener to die. The real fix lives in
++        # single_controller/ray/base.py:get_master_addr_port which now picks
++        # from a randomised high-range pool. This retry remains as a belt-and-
++        # suspenders safety net for the rare case where the chosen port races
++        # with a vLLM EngineCore IPC socket grab.
++        max_attempts = int(os.environ.get("VERL_PG_INIT_MAX_ATTEMPTS", "4"))
++        backoff_s = float(os.environ.get("VERL_PG_INIT_BACKOFF_S", "5.0"))
++        last_exc = None
++        for attempt in range(1, max_attempts + 1):
++            try:
++                torch.distributed.init_process_group(
++                    backend=backend,
++                    rank=rank,
++                    world_size=world_size,
++                    timeout=timeout,
++                    init_method=init_method,
++                )
++                last_exc = None
++                break
++            except RuntimeError as e:
++                # Note: PyTorch's DistNetworkError (subclass of RuntimeError)
++                # is what actually fires on TCPStore-listen collisions, and
++                # the message text is lowercase "address already in use". Match
++                # case-insensitively + accept the EADDRINUSE keyword too.
++                msg = str(e).lower()
++                # Only retry on the transient TCPStore rendezvous failure modes.
++                # Re-raise immediately for anything else so we don't mask real bugs.
++                transient = (
++                    "nonce == returnednonce" in msg
++                    or "address already in use" in msg
++                    or "eaddrinuse" in msg
++                )
++                if not transient or attempt == max_attempts:
++                    raise
++                last_exc = e
++                print(
++                    f"[verl distributed] init_process_group attempt {attempt}/{max_attempts} "
++                    f"failed (rank={rank}): {str(e).splitlines()[0]}; retrying in {backoff_s}s",
++                    flush=True,
++                )
++                time.sleep(backoff_s)
++        if last_exc is not None:
++            raise last_exc
+ 
+ 
+ def stateless_init_process_group(master_address, master_port, rank, world_size, device):
+diff --git a/verl/utils/reward_score/__init__.py b/verl/utils/reward_score/__init__.py
+index 180dc6b1..96b7ba8c 100644
+--- a/verl/utils/reward_score/__init__.py
++++ b/verl/utils/reward_score/__init__.py
+@@ -46,16 +46,16 @@ def default_compute_score(
+ 
+         res = gsm8k.compute_score(solution_str, ground_truth)
+     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+-        from . import math_reward
++        # from . import math_reward
+ 
+-        res = math_reward.compute_score(solution_str, ground_truth)
++        # res = math_reward.compute_score(solution_str, ground_truth)
+         # [Optional] Math-Verify Integration
+         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
+         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
+         # To use it, override the `compute_score` function with the following implementation:
+ 
+-        # from . import math_verify
+-        # res = math_verify.compute_score(solution_str, ground_truth)
++        from . import math_verify
++        res = math_verify.compute_score(solution_str, ground_truth)
+     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+         from . import math_dapo
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 3b245904..8eca7f52 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -277,6 +277,16 @@ class vLLMHttpServer:
+             **engine_kwargs,
+         }
+ 
++        # [J-Zero patch] opt-in language_model_only via env var
++        # (vLLM >= 0.22 loads only the language tower of a multimodal model).
++        import os as _os
++        if _os.environ.get("CW_LANGUAGE_MODEL_ONLY", "").lower() == "true":
++            args["language_model_only"] = True
++        # [J-Zero patch] opt-in attention backend override via env var.
++        _cw_att = _os.environ.get("CW_ATTENTION_BACKEND")
++        if _cw_att:
++            args["attention_backend"] = _cw_att
++
+         # update profiler args
+         profiler_args = build_vllm_profiler_args(
+             self.profiler_controller.config, self.profiler_controller.tool_config, self.replica_rank
+@@ -858,6 +868,16 @@ class vLLMHttpServer:
+         quantization = self.config.quantization
+         hf_overrides = {}
+ 
++        # [J-Zero patch] allow user-supplied hf_overrides via env var
++        # (e.g. architectures override for VLM checkpoints with custom CausalLM).
++        import os, json as _json
++        _cw_env = os.environ.get("CW_HF_OVERRIDES")
++        if _cw_env:
++            try:
++                hf_overrides.update(_json.loads(_cw_env))
++            except Exception:
++                pass
++
+         if is_torch_npu_available(check_device=False):
+             from verl.utils.vllm.npu_vllm_patch import check_vllm_ascend_before_server_launch
+ 
+@@ -1017,6 +1037,14 @@ class vLLMReplica(RolloutReplica):
+                 # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                 "NCCL_CUMEM_ENABLE": "0",
+             }
++            # [J-Zero patch] disjoint VLLM_PORT base per replica to avoid EADDRINUSE race
++            # in MultiprocExecutor's worker init_process_group (vllm close-after-bind race
++            # when n_gpus_per_node > tp_size and replicas are spawned concurrently).
++            _vllm_port_base = int(os.environ.get("RZERO_VLLM_PORT_BASE", "40000"))
++            _vllm_port_stride = int(os.environ.get("RZERO_VLLM_PORT_STRIDE", "200"))
++            env_vars["VLLM_PORT"] = str(
++                _vllm_port_base + (self.replica_rank * nnodes + node_rank) * _vllm_port_stride
++            )
+             server = self.server_class.options(
+                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                     node_id=node_id,
