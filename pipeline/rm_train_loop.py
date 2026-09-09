@@ -184,12 +184,11 @@ def main(args: argparse.Namespace) -> None:
     tokenizer = load_skywork_tokenizer(args.init_model)
 
     _log0(rank, f"[rm_train] loading model from {args.init_model}")
-    # Load bf16 on CPU first (FSDP shards to GPU after wrap) so 4 ranks don't
-    # thrash the HF cache on GPU 0.
+    # Keep FP32 master weights; FSDP casts to bf16 for forward/backward.
     model = AutoModelForSequenceClassification.from_pretrained(
         args.init_model,
         num_labels=1,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float32,
         attn_implementation=args.attn_impl,
     )
     # force-sync to tokenizer pad to avoid SC head reading at left-padded positions
@@ -341,14 +340,11 @@ def main(args: argparse.Namespace) -> None:
     if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
         _log0(rank, f"[rm_train] writing HF checkpoint to {save_dir}")
-        # Rehydrate on CPU to save from: the FSDP-wrapped model's
-        # save_pretrained would shard the file. from_pretrained(bfloat16), NOT
-        # from_config — the latter builds fp32, doubling RAM here and writing
-        # 2x-larger safetensors that the inference server reloads in bf16.
+        # Preserve FP32 master weights for the next round.
         cpu_model = AutoModelForSequenceClassification.from_pretrained(
             args.init_model,
             num_labels=1,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             # Skip FA2 here — bare CPU build, only used as a state_dict shell.
             attn_implementation="eager",
         )

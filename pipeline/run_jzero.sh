@@ -91,6 +91,8 @@ for ITER in $(seq "$START_ITER" $NITER); do
     NEW_RM="$PREV_RM"
     if [[ "$RZERO_RM_TRAIN_ENABLE" == "1" ]]; then
         RM_EXP="iter${ITER}_rm_${TAG}"
+        rzero_rm_pair_mix "$ITER"
+        echo "[run_jzero] iter $ITER RM pairs: chalneg=$RZERO_RM_N_CHAL subtask=$RZERO_RM_N_SUBTASK"
         # Must use rzero_rm_steps() (env_prelude.sh) — the same derivation
         # rm_train.sh uses for its SAVE_DIR — or the resume check misses.
         EXPECTED_RM_CKPT="$CKPT_ROOT/$RM_EXP/global_step_$(rzero_rm_steps)/actor/huggingface"

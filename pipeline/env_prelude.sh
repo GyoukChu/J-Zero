@@ -79,6 +79,31 @@ rzero_rm_steps() {
     echo "${RZERO_RM_STEPS:-$(( (total + batch - 1) / batch ))}"
 }
 
+# Stage-3 pair-mix schedule (off by default). RZERO_RM_PAIR_SCHEDULE=linear:
+# chalneg share = RZERO_RM_PAIR_R0 (0.8) at iter 1 -> 0.5 at RZERO_RM_PAIR_ITER_END (7),
+# linear in between, 0.5 after; total pairs (and rzero_rm_steps) unchanged.
+rzero_rm_pair_mix() {  # $1 = iteration
+    local default_pairs=256
+    [[ "${SMOKE:-0}" == "1" ]] && default_pairs=8
+    export RZERO_RM_N_CHAL=${RZERO_RM_N_CHAL:-$default_pairs}
+    export RZERO_RM_N_SUBTASK=${RZERO_RM_N_SUBTASK:-$default_pairs}
+    [[ "${RZERO_RM_PAIR_SCHEDULE:-off}" == "linear" ]] || return 0
+    local it="$1" end="${RZERO_RM_PAIR_ITER_END:-7}" r0 r total n_chal
+    [[ "$end" =~ ^[1-9][0-9]*$ && "$end" -ge 2 ]] || {
+        echo "[rm_pair_mix] RZERO_RM_PAIR_ITER_END must be an integer >= 2" >&2; return 1;
+    }
+    r0=$(awk -v r="${RZERO_RM_PAIR_R0:-0.8}" 'BEGIN {
+        if (r !~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ || r <= 0 || r > 1) exit 1
+        printf "%d", r*1000
+    }') || { echo "[rm_pair_mix] RZERO_RM_PAIR_R0 must be a number in (0, 1]" >&2; return 1; }
+    total=$(( RZERO_RM_N_CHAL + RZERO_RM_N_SUBTASK ))
+    if [[ -z "${RZERO_RM_PAIR_TOTAL:-}" ]]; then export RZERO_RM_PAIR_TOTAL=$total; else total=$RZERO_RM_PAIR_TOTAL; fi
+    if [[ "$it" -ge "$end" ]]; then r=500; else r=$(( r0 - (r0 - 500) * (it - 1) / (end - 1) )); fi
+    n_chal=$(( (total * r + 500) / 1000 ))
+    [[ "$n_chal" -gt 0 ]] || { echo "[rm_pair_mix] mix must yield at least one challenger-negative pair" >&2; return 1; }
+    export RZERO_RM_N_CHAL=$n_chal RZERO_RM_N_SUBTASK=$(( total - n_chal ))
+}
+
 # Bound wandb's end-of-stage flush: without it an unreachable backend hangs
 # every stage at teardown with the GPUs idle. Unsent data stays on disk for the
 # `wandb sync` the stage scripts run. The verl patch adds a coarser outer bound

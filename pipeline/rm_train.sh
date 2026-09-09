@@ -40,7 +40,9 @@ TOTAL_PAIRS=$(( N_CHAL + N_SUB ))
 RM_STEPS=$(rzero_rm_steps)
 RM_LR=${RZERO_RM_LR:-5e-7}; RM_MAX_LEN=${RZERO_RM_MAX_LEN:-8192}
 RM_MICRO_BATCH=${RZERO_RM_MICRO_BATCH:-4}; RM_GRAD_CKPT=${RZERO_RM_GRAD_CKPT:-1}
-GEN_GPU=${RZERO_CHALNEG_GEN_GPU:-0}; GEN_MEM_UTIL=${RZERO_CHALNEG_GEN_MEM_UTIL:-0.85}
+# Pair generation uses one independent vLLM worker per GPU.
+GEN_GPUS=${RZERO_RM_GEN_GPUS:-${RZERO_CHALNEG_GEN_GPU:-0,1,2,3}}
+GEN_MEM_UTIL=${RZERO_CHALNEG_GEN_MEM_UTIL:-0.85}
 OVERSAMPLE=${RZERO_CHALNEG_OVERSAMPLE:-1.5}
 # Fresh-solver pair building (default ON): regenerate the solver-side answers
 # (chalneg chosen / subtask one-shot rejected) with the just-trained solver_t.
@@ -69,7 +71,7 @@ else
     # --- (A) chalneg ---------------------------------------------------------
     if [[ ! -f "$CHAL_PAIRS" ]]; then
         echo "[rm_train] (A) chalneg pair build (N=$N_CHAL)"
-        CUDA_VISIBLE_DEVICES=$GEN_GPU python "$SCRIPT_DIR/rm_data/build_pairs_challenger_neg.py" \
+        CUDA_VISIBLE_DEVICES=$GEN_GPUS python "$SCRIPT_DIR/rm_data/build_pairs_challenger_neg.py" \
             --in_dir "$SOLVER_FILTERED_DIR" --save_name "$SOLVER_SAVE_NAME" \
             --exclude_parquet "$SOLVER_TRAIN_PARQUET" --out_path "$CHAL_PAIRS" \
             --challenger_model "$CHALLENGER_MODEL" --target_pairs "$N_CHAL" \
@@ -88,7 +90,7 @@ else
     MAXSUB=${RZERO_RM_SUBTASK_MAXSUB:-5}
     if [[ ! -f "$SUB_PAIRS" ]]; then
         echo "[rm_train] (B) IDA subtask-amplification build (N=$N_SUB, max_subtasks=$MAXSUB)"
-        CUDA_VISIBLE_DEVICES=$GEN_GPU python "$SCRIPT_DIR/rm_data/build_pairs_subtask.py" \
+        CUDA_VISIBLE_DEVICES=$GEN_GPUS python "$SCRIPT_DIR/rm_data/build_pairs_subtask.py" \
             --model "$SOLVER_MODEL" \
             --in_dir "$SOLVER_FILTERED_DIR" --save_name "$SOLVER_SAVE_NAME" \
             --exclude_parquet "$SOLVER_TRAIN_PARQUET" --out_path "$SUB_PAIRS" \

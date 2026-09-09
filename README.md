@@ -174,6 +174,13 @@ bash launch/launch_jzero_4gpu.sh
 - Resume: completed challenger/solver/RM checkpoints are detected and skipped;
   rerun the same wrapper (or set `RZERO_START_ITER`) to continue.
 - Stage 3 uses the challenger-negative + IDA subtask pair builders (the paper method).
+- `RZERO_RM_PAIR_SCHEDULE=linear` ramps the Stage-3 mix from 8:2 (challenger-negative : subtask)
+  at round 1 to 5:5 at round `RZERO_RM_PAIR_ITER_END` (default 7), then holds 5:5; the
+  512-pair budget is unchanged. Default (unset) is the paper's fixed 5:5.
+  `RZERO_RM_PAIR_R0` overrides the initial challenger-negative share (`0 < r0 <= 1`);
+  `RZERO_RM_PAIR_ITER_END` must be an integer >= 2. The mix must yield at least one challenger-negative pair.
+  When changing the schedule or pair budget, use fresh directories for **both `OUT_ROOT` and `CKPT_ROOT`**;
+  existing pair files and checkpoints are reused without checking the mix.
 - The wrappers take `${VAR:-default}` for `BASE_MODEL`, `RZERO_NITER`,
   `CKPT_ROOT` and `OUT_ROOT`, so a released run can be shortened in place:
   `RZERO_NITER=3 bash launch/run_jzero_4b.sh`. `RZERO_TAG` is fixed per wrapper
