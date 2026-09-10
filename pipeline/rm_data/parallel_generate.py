@@ -7,9 +7,10 @@ from concurrent.futures import ProcessPoolExecutor
 
 def _generate(gpu, model_path, chats, seed, mem, sampling, model_kwargs):
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
-    # Let each engine choose free ports instead of inheriting a shared port.
-    for key in ("VLLM_PORT", "MASTER_PORT"):
-        os.environ.pop(key, None)
+    # Give each shard its own port range: vLLM probes VLLM_PORT upward, so
+    # concurrent shards never race for the same OS-assigned free port.
+    os.environ["VLLM_PORT"] = str(int(os.environ.get("VLLM_PORT", "31000")) + 1000 * shard)
+    os.environ.pop("MASTER_PORT", None)
     import vllm
     from transformers import AutoTokenizer
 
