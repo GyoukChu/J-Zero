@@ -1,4 +1,4 @@
-# *J-Zero*: Unified Challenger--Solver--Judge Co-Evolution from Zero Data
+# *J-Zero*: Unified Challenger--Solver--Judge Self-Evolution from Zero Data
 
 [![arXiv](https://img.shields.io/badge/Paper-arXiv:2608.26582-Green)](https://arxiv.org/abs/2608.26582)  [![BibTex](https://img.shields.io/badge/Paper-BibTex-yellow)](#bibtex)
 
@@ -240,8 +240,8 @@ If you find this repo useful for your research, please consider citing us:
 
 ```
 @article{chu2026jzero,
-  title   = {J-Zero: Unified Challenger--Solver--Judge Co-Evolution from Zero Data},
-  author  = {Chu, Gyouk and Jeon, Myeongho and Yang, Eunho},
+  title   = {J-Zero: Unified Challenger--Solver--Judge Self-Evolution from Zero Data},
+  author  = {Chu, Gyouk and Jeon, Myeongho and Yeo, Teresa and Yang, Eunho},
   journal = {arXiv preprint arXiv:2608.26582},
   year    = {2026}
 }
