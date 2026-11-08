@@ -124,6 +124,64 @@ echo "[eval] model=$MODEL slug=$SLUG GPU_SET=$GPU_SET (judge=$JG, test=$TG) out=
 preflight_cleanup
 
 # ---------------------------------------------------------------------------
+# GPU-overlap scheduling (EVAL_OVERLAP=1, default). Result-neutral: every
+# benchmark keeps its exact prompts, decoding parameters, judge models, chat
+# templates, max lengths and serving flags; only WHEN/WHERE independent stages
+# run changes:
+#   P2  IFEval runs on ${G[1]} while the math recheck judge holds ${G[0]}, and
+#       the phase-3 gemma judge + test endpoint are brought up on ${G[2]},${G[3]}
+#       during that same window (the two Qwen judges follow as ${G[1]},${G[0]}
+#       free up), so phase 3 starts with warm servers.
+#   P3  AlpacaEval (gen on the test endpoint, judging on the first phase-3 Qwen
+#       judge — the same Qwen3.6-27B no-think instance config phase 4 used)
+#       runs concurrently with Arena-Hard and EQ-Bench; phase 4 then has
+#       nothing left to do.
+# EVAL_OVERLAP=0 restores the original strictly-sequential schedule.
+# Caveat shared with the original: vLLM greedy decoding is not batch-invariant,
+# so co-scheduled requests (already Arena || EQ-Bench on one test endpoint; now
+# also AlpacaEval) can differ at the token level between runs. Scores were
+# never bit-reproducible run-to-run; the overlap changes batch composition, not
+# any evaluation setting.
+# ---------------------------------------------------------------------------
+EVAL_OVERLAP=${EVAL_OVERLAP:-1}
+PRESTARTED=0   # 1 once the phase-3 servers were launched early (in phase 2)
+ALPACA_DONE=0  # 1 once AlpacaEval completed inside phase 3 (this run only)
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+
+start_qwen(){  # $1 gpu  $2 port
+  GPUS="$1" PORT=$2 DP=1 MAXLEN=32768 CHAT_TEMPLATE="$NOTHINK" \
+    nohup bash "$GEN/serve_judge_vllm.sh" Qwen/Qwen3.6-27B qwen36-judge \
+    > "$OUT/judge_qwen_$2.log" 2>&1 &
+}
+start_gemma(){ # $1 gpu  $2 port
+  # gemma judges EQ-Bench pieces embedded whole: a degenerate 12000-token piece
+  # re-tokenizes ~2x larger in gemma's tokenizer (24k measured), so 32768 leaves
+  # <10% headroom over prompt+4096 output. 49152 makes the judge prompt
+  # structurally unable to overflow.
+  GPUS="$1" PORT=$2 DP=1 MAXLEN=49152 \
+    nohup bash "$GEN/serve_judge_vllm.sh" google/gemma-4-31b-it gemma4-judge \
+    > "$OUT/judge_gemma_$2.log" 2>&1 &
+}
+start_test(){  # $1 gpu
+  GPUS="$1" PORT=$P_TEST DP=1 MAXLEN=16384 \
+    nohup bash "$GEN/serve_judge_vllm.sh" "$MODEL" "$SERVED_NAME" \
+    > "$OUT/serve_test.log" 2>&1 &
+}
+# Block until a GPU's memory is (nearly) released by the previous tenant, so a
+# server started right after it cannot fail allocation against lingering
+# memory. $1 = GPU index, $2 = max seconds (default 180).
+wait_gpu_free(){
+  local g=$1 max=${2:-180} i used
+  for i in $(seq 1 "$max"); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" 2>/dev/null | head -1 | tr -d ' ')
+    [ -n "$used" ] && [ "$used" -lt 3000 ] && return 0
+    sleep 1
+  done
+  echo "[eval] WARN: GPU $g still holds ${used:-?} MiB after ${max}s; continuing"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # PHASE 1: EM 3 (DP=4) sequential on the 4 GPUs
 # ---------------------------------------------------------------------------
 if [ "$PHASE_START" -le 1 ]; then
@@ -140,20 +198,57 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$PHASE_START" -le 2 ]; then
 echo "[eval] PHASE 2: math 7 + IFEval"
-t=$(date +%s)
-EVAL_GPUS="$GPU_SET" JUDGE_GPU="${G[0]}" RZERO_VENV="$GEN_VENV" \
-  DATA_DIR="${DATA_DIR:-$ROOT/data}" \
-  JUDGE_VENV_PY="$JUDGE_VENV/bin/python" \
-  NOTHINK_JINJA="$NOTHINK" \
-  bash "$RECIPE/evaluate/run_solver_eval.sh" "$MODEL" "$OUT/math_recheck" > "$OUT/math7.log" 2>&1
-mark math7 $(( $(date +%s) - t ))
-t=$(date +%s)
 IFE="$OUT/ifeval"; mkdir -p "$IFE"; PREP="$ROOT/outputs/eval_standard/_prepared/ifeval.jsonl"
-CUDA_VISIBLE_DEVICES="${G[0]}" VLLM_PORT=$((${EM_VLLM_BASE:-52000}+${G[0]}*100)) MASTER_PORT=$((${EM_MASTER_BASE:-56000}+${G[0]}*100)) \
-  $VERL_PY "$SELF/gen_vllm.py" --model "$MODEL" --in "$PREP" --out "$IFE/responses.jsonl" \
-    --dp_shard 0 --dp_total 1 --max_tokens 2048 --max_model_len 8192 > "$OUT/ifeval.log" 2>&1 \
-  && $VERL_PY "$SELF/score_ifeval.py" --prepared "$PREP" --responses "$IFE/responses.jsonl" --out "$IFE/score.json" >> "$OUT/ifeval.log" 2>&1
-mark ifeval $(( $(date +%s) - t ))
+MATH_RUN(){
+  EVAL_GPUS="$GPU_SET" JUDGE_GPU="${G[0]}" RZERO_VENV="$GEN_VENV" \
+    DATA_DIR="${DATA_DIR:-$ROOT/data}" \
+    JUDGE_VENV_PY="$JUDGE_VENV/bin/python" \
+    NOTHINK_JINJA="$NOTHINK" \
+    bash "$RECIPE/evaluate/run_solver_eval.sh" "$MODEL" "$OUT/math_recheck" > "$OUT/math7.log" 2>&1
+}
+IFEVAL_RUN(){ # $1 = GPU index (ports keyed off the GPU index, as for the EM shards)
+  local g=$1
+  CUDA_VISIBLE_DEVICES="$g" VLLM_PORT=$((${EM_VLLM_BASE:-52000}+g*100)) MASTER_PORT=$((${EM_MASTER_BASE:-56000}+g*100)) \
+    $VERL_PY "$SELF/gen_vllm.py" --model "$MODEL" --in "$PREP" --out "$IFE/responses.jsonl" \
+      --dp_shard 0 --dp_total 1 --max_tokens 2048 --max_model_len 8192 > "$OUT/ifeval.log" 2>&1 \
+    && $VERL_PY "$SELF/score_ifeval.py" --prepared "$PREP" --responses "$IFE/responses.jsonl" --out "$IFE/score.json" >> "$OUT/ifeval.log" 2>&1
+}
+if [ "$EVAL_OVERLAP" = 1 ]; then
+  # math: 4-GPU generation, then the recheck judge alone on ${G[0]}.
+  # run_solver_eval.sh touches math_recheck/.gen_done once generation has
+  # released the GPUs; until then (or until it exits) nothing else may run.
+  GEN_DONE="$OUT/math_recheck/.gen_done"; mkdir -p "$OUT/math_recheck"; rm -f "$GEN_DONE"
+  t_math=$(date +%s)
+  MATH_RUN & MPID=$!
+  while kill -0 $MPID 2>/dev/null && [ ! -f "$GEN_DONE" ]; do sleep 5; done
+  [ -f "$GEN_DONE" ] && echo "[eval] phase2: math generation done, recheck judge on ${G[0]}; using ${G[1]}-${G[3]} meanwhile"
+  wait_gpu_free "${G[1]}" 120; wait_gpu_free "${G[2]}" 120; wait_gpu_free "${G[3]}" 120
+  # IFEval on ${G[1]} (same script/params as before; only the GPU index differs)
+  t_if=$(date +%s)
+  IFEVAL_RUN "${G[1]}" & IPID=$!
+  # Phase-3 servers that need no phase-2 GPU: gemma judge on ${G[2]}, test endpoint on ${G[3]}.
+  if [ "$PHASE_START" -le 3 ]; then
+    kill_port $P_Q1 $P_G1 $P_G2 $P_G3 $P_TEST
+    start_gemma "${G[2]}" $P_G3
+    start_test  "${G[3]}"
+    PRESTARTED=1
+  fi
+  wait $IPID; IRC=$?
+  mark ifeval $(( $(date +%s) - t_if ))
+  [ "$IRC" -ne 0 ] && echo "[eval] phase2: IFEval exit=$IRC (see $OUT/ifeval.log)"
+  if [ "$PRESTARTED" = 1 ]; then wait_gpu_free "${G[1]}" 120; start_qwen "${G[1]}" $P_G2; fi
+  wait $MPID; MRC=$?
+  mark math7 $(( $(date +%s) - t_math ))
+  [ "$MRC" -ne 0 ] && echo "[eval] phase2: math7 exit=$MRC (see $OUT/math7.log)"
+  if [ "$PRESTARTED" = 1 ]; then wait_gpu_free "${G[0]}" 180; start_qwen "${G[0]}" $P_G1; fi
+else
+  t=$(date +%s)
+  MATH_RUN
+  mark math7 $(( $(date +%s) - t ))
+  t=$(date +%s)
+  IFEVAL_RUN "${G[0]}"
+  mark ifeval $(( $(date +%s) - t ))
+fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -163,6 +258,33 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$PHASE_START" -le 3 ]; then
 echo "[eval] PHASE 3: Qwen3.6 x2 (hard_prompt) + gemma x1 (creative_writing/EQ-Bench) + persistent test -> Arena || EQ-Bench"
+if [ "$PRESTARTED" = 1 ]; then
+  # Servers were launched during phase 2 (same commands/flags as below); just
+  # confirm each is healthy, in the same order and with the same deadlines.
+  echo "[eval] phase3: judges/test endpoint pre-started in phase 2 — waiting for health"
+  # A pre-started server that fails health is restarted once, sequentially (the
+  # original startup order), before the run gives up.
+  i=0
+  for spec in "qwen:$P_G1" "qwen:$P_G2" "gemma:$P_G3"; do
+    kind=${spec%%:*}; p=${spec##*:}
+    if ! wait_health "http://127.0.0.1:$p/health" 300; then
+      echo "[eval] phase3: pre-started $kind :$p unhealthy (see $OUT/judge_${kind}_$p.log) — restarting it sequentially"
+      kill_port $p; wait_gpu_free "${G[$i]}" 180
+      if [ "$kind" = qwen ]; then start_qwen "${G[$i]}" $p; else start_gemma "${G[$i]}" $p; fi
+      wait_health "http://127.0.0.1:$p/health" 300 \
+        || { echo "[eval] FATAL judge $p ($kind) failed to start; see $OUT/judge_${kind}_$p.log"; \
+             kill_port $P_G1 $P_G2 $P_G3 $P_TEST; exit 1; }
+    fi
+    i=$((i+1))
+  done
+  if ! wait_health "http://127.0.0.1:$P_TEST/health" 240; then
+    echo "[eval] phase3: pre-started test endpoint :$P_TEST unhealthy (see $OUT/serve_test.log) — restarting it"
+    kill_port $P_TEST; wait_gpu_free "$TG" 180; start_test "$TG"
+    wait_health "http://127.0.0.1:$P_TEST/health" 240 \
+      || { echo "[eval] FATAL test model failed to start; see $OUT/serve_test.log"; \
+           kill_port $P_G1 $P_G2 $P_G3 $P_TEST; exit 1; }
+  fi
+else
 kill_port $P_Q1 $P_G1 $P_G2 $P_G3 $P_TEST
 
 # Judges on the 3 judge GPUs:
@@ -173,19 +295,7 @@ kill_port $P_Q1 $P_G1 $P_G2 $P_G3 $P_TEST
 i=0
 for spec in "qwen:$P_G1" "qwen:$P_G2" "gemma:$P_G3"; do
   kind=${spec%%:*}; p=${spec##*:}
-  if [ "$kind" = qwen ]; then
-    GPUS="${G[$i]}" PORT=$p DP=1 MAXLEN=32768 CHAT_TEMPLATE="$NOTHINK" \
-      nohup bash "$GEN/serve_judge_vllm.sh" Qwen/Qwen3.6-27B qwen36-judge \
-      > "$OUT/judge_qwen_$p.log" 2>&1 &
-  else
-    # gemma judges EQ-Bench pieces embedded whole: a degenerate 12000-token
-    # piece re-tokenizes ~2x larger in gemma's tokenizer (24k measured), so
-    # 32768 leaves <10% headroom over prompt+4096 output. 49152 makes the
-    # judge prompt structurally unable to overflow.
-    GPUS="${G[$i]}" PORT=$p DP=1 MAXLEN=49152 \
-      nohup bash "$GEN/serve_judge_vllm.sh" google/gemma-4-31b-it gemma4-judge \
-      > "$OUT/judge_gemma_$p.log" 2>&1 &
-  fi
+  if [ "$kind" = qwen ]; then start_qwen "${G[$i]}" $p; else start_gemma "${G[$i]}" $p; fi
   i=$((i+1))
   wait_health "http://127.0.0.1:$p/health" 300 \
     || { echo "[eval] FATAL judge $p ($kind) failed to start; see $OUT/judge_${kind}_$p.log"; \
@@ -193,12 +303,11 @@ for spec in "qwen:$P_G1" "qwen:$P_G2" "gemma:$P_G3"; do
 done
 # Persistent test/gen vLLM at :$P_TEST — used by Phases 3 AND 4, not killed
 # between them.
-GPUS="$TG" PORT=$P_TEST DP=1 MAXLEN=16384 \
-  nohup bash "$GEN/serve_judge_vllm.sh" "$MODEL" "$SERVED_NAME" \
-  > "$OUT/serve_test.log" 2>&1 &
+start_test "$TG"
 wait_health "http://127.0.0.1:$P_TEST/health" 240 \
   || { echo "[eval] FATAL test model failed to start; see $OUT/serve_test.log"; \
        kill_port $P_G1 $P_G2 $P_G3 $P_TEST; exit 1; }
+fi
 
 ARENA=${ARENA_DIR:-$ROOT/third_party/arena-hard-auto}
 BENCH=${BENCH_DIR:-$ROOT/third_party/creative-writing-bench}
@@ -356,13 +465,57 @@ PY
   return $rc
 }
 
+# --- AlpacaEval 2.0 (GPT-4-Turbo baseline, Qwen3.6-27B no-think judge) ---
+# Judge endpoint: ALPACA_JUDGE_PORT (phase-3 overlap uses the first phase-3 Qwen
+# judge, identical model/template/max-len to the dedicated phase-4 instance).
+ALPACA_BLOCK(){
+  local t=$(date +%s)
+  local AOUT="$OUT/alpaca"; mkdir -p "$AOUT"
+  local PROMPTS=$ROOT/outputs/eval_gen/alpaca/_prep/prompts.jsonl
+  local REF=$ROOT/outputs/eval_gen/alpaca/_prep/reference_gpt4turbo.json
+  $VERL_PY "$SELF/gen_http.py" --base_url http://127.0.0.1:$P_TEST/v1 \
+    --model_name "$SERVED_NAME" --tokenizer "$MODEL" --in "$PROMPTS" \
+    --out "$AOUT/responses.jsonl" --max_tokens 4096 --workers 96 \
+    > "$OUT/alpaca_gen.log" 2>&1
+  $GB_PY "$SELF/to_alpaca_outputs.py" --prompts "$PROMPTS" --responses "$AOUT/responses.jsonl" \
+    --generator "$SLUG" --out "$AOUT/model_outputs.json" >> "$OUT/alpaca_gen.log" 2>&1
+  ( cd "$ROOT" && OPENAI_API_BASE=http://127.0.0.1:${ALPACA_JUDGE_PORT:-$P_Q1}/v1 OPENAI_API_KEY=dummy IS_ALPACA_EVAL_2=True \
+    "$AE_BIN" evaluate --model_outputs "$AOUT/model_outputs.json" --reference_outputs "$REF" \
+    --annotators_config weighted_alpaca_eval_local_qwen36 --output_path "$AOUT/" --caching_path None \
+  ) > "$OUT/alpaca_judge.log" 2>&1
+  mark alpacaeval $(( $(date +%s) - t ))
+}
+
+ALPACA_DONE_MARK="$OUT/alpaca/weighted_alpaca_eval_local_qwen36/leaderboard.csv"
+
 ARENA_BLOCK > "$OUT/arena_runner.log" 2>&1 &
 APID=$!
 EQBENCH_BLOCK > "$OUT/eqbench_runner.log" 2>&1 &
 EPID=$!
+ALPID=""
+if [ "$EVAL_OVERLAP" = 1 ]; then
+  # AlpacaEval alongside Arena/EQ-Bench: generation on the shared test endpoint,
+  # judging on the phase-3 Qwen judge at $P_G1 (same instance config as the
+  # phase-4 judge). Any failure here falls back to the sequential phase 4.
+  rm -f "$ALPACA_DONE_MARK"
+  ALPACA_JUDGE_PORT=$P_G1 ALPACA_BLOCK > "$OUT/alpaca_runner.log" 2>&1 &
+  ALPID=$!
+fi
 wait $APID; ARC=$?
 wait $EPID; EQC=$?
 echo "[eval] phase3: arena exit=$ARC, eqbench exit=$EQC"
+if [ -n "$ALPID" ]; then
+  wait $ALPID; ALC=$?
+  if [ "$ALC" -eq 0 ] && [ -s "$ALPACA_DONE_MARK" ]; then
+    ALPACA_DONE=1
+    echo "[eval] phase3: alpacaeval done alongside arena/eqbench (judge :$P_G1)"
+  else
+    echo "[eval] phase3: alpacaeval overlap FAILED (exit=$ALC, see $OUT/alpaca_runner.log) — phase 4 will redo it sequentially"
+    # Drop every artifact of the attempt: gen_http.py reuses an existing
+    # responses.jsonl, so a partial file would otherwise feed the rerun.
+    rm -f "$ALPACA_DONE_MARK" "$OUT/alpaca/responses.jsonl" "$OUT/alpaca/model_outputs.json"
+  fi
+fi
 if [ "$ARC" -ne 0 ]; then
   echo "[eval] phase3: arena-hard FAILED (see $OUT/arena_runner.log); it will show as (missing) in RESULTS.txt"
 fi
@@ -378,7 +531,9 @@ fi
 # PHASE 4: Qwen3.6-27B judge (on ${G[0]}) + persistent test :$P_TEST
 #          -> AlpacaEval (gen via HTTP to the test endpoint)
 # ---------------------------------------------------------------------------
-if [ "$PHASE_START" -le 4 ]; then
+if [ "${ALPACA_DONE:-0}" = 1 ]; then
+  echo "[eval] PHASE 4: skipped — AlpacaEval already completed during phase 3"
+elif [ "$PHASE_START" -le 4 ]; then
 echo "[eval] PHASE 4: Qwen3.6 judge + reuse test endpoint -> AlpacaEval"
 
 # Re-validate the persistent test endpoint (in case running phase4 standalone).
@@ -401,26 +556,6 @@ GPUS="${G[0]}" PORT=$P_Q1 DP=1 MAXLEN=32768 CHAT_TEMPLATE="$NOTHINK" \
 wait_health "http://127.0.0.1:$P_Q1/health" 240 \
   || { echo "[eval] FATAL qwen36 $P_Q1 failed to start; see $OUT/judge_qwen_$P_Q1.log"; \
        kill_port $P_Q1 $P_TEST; exit 1; }
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
-
-# --- AlpacaEval 2.0 (GPT-4-Turbo baseline, Qwen3.6-27B no-think judge) ---
-ALPACA_BLOCK(){
-  local t=$(date +%s)
-  local AOUT="$OUT/alpaca"; mkdir -p "$AOUT"
-  local PROMPTS=$ROOT/outputs/eval_gen/alpaca/_prep/prompts.jsonl
-  local REF=$ROOT/outputs/eval_gen/alpaca/_prep/reference_gpt4turbo.json
-  $VERL_PY "$SELF/gen_http.py" --base_url http://127.0.0.1:$P_TEST/v1 \
-    --model_name "$SERVED_NAME" --tokenizer "$MODEL" --in "$PROMPTS" \
-    --out "$AOUT/responses.jsonl" --max_tokens 4096 --workers 96 \
-    > "$OUT/alpaca_gen.log" 2>&1
-  $GB_PY "$SELF/to_alpaca_outputs.py" --prompts "$PROMPTS" --responses "$AOUT/responses.jsonl" \
-    --generator "$SLUG" --out "$AOUT/model_outputs.json" >> "$OUT/alpaca_gen.log" 2>&1
-  ( cd "$ROOT" && OPENAI_API_BASE=http://127.0.0.1:$P_Q1/v1 OPENAI_API_KEY=dummy IS_ALPACA_EVAL_2=True \
-    "$AE_BIN" evaluate --model_outputs "$AOUT/model_outputs.json" --reference_outputs "$REF" \
-    --annotators_config weighted_alpaca_eval_local_qwen36 --output_path "$AOUT/" --caching_path None \
-  ) > "$OUT/alpaca_judge.log" 2>&1
-  mark alpacaeval $(( $(date +%s) - t ))
-}
 
 ALPACA_BLOCK > "$OUT/alpaca_runner.log" 2>&1
 echo "[eval] phase4: alpaca exit=$?"

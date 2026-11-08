@@ -34,6 +34,11 @@ import random
 import re
 from typing import Dict, List
 
+if __package__:
+    from .parallel_generate import generate
+else:
+    from parallel_generate import generate
+
 os.environ.setdefault("VLLM_USE_FLASHINFER", "0")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
@@ -146,26 +151,11 @@ def _subtasks(text: str, k: int) -> List[str]:
 
 
 def _vllm(model_path, sys_prompt, users, *, seed, max_tokens, temperature, top_p, mem, n=1):
-    import vllm
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_path)
-    llm = vllm.LLM(model=model_path, tokenizer=model_path, gpu_memory_utilization=mem,
-                   seed=int(seed), enforce_eager=True, trust_remote_code=True)
-    sp = vllm.SamplingParams(n=n, max_tokens=max_tokens, temperature=temperature,
-                             top_p=top_p, stop_token_ids=[tok.eos_token_id])
     chats = [([{"role": "system", "content": sys_prompt}] if sys_prompt else []) + [{"role": "user", "content": u}] for u in users]
-    if tok.chat_template:
-        prompts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True,
-                                           add_special_tokens=True) for c in chats]
-    else:
-        prompts = ["\n".join(f"{m['role']}: {m['content']}" for m in c) for c in chats]
-    res = llm.generate(prompts, sampling_params=sp, use_tqdm=True)
-    if n == 1:
-        out = [r.outputs[0].text if r.outputs else "" for r in res]
-    else:
-        out = [[o.text for o in r.outputs] for r in res]
-    del llm
-    return out
+    out = generate(model_path, chats, seed=seed, mem=mem, n=n,
+                   max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+                   enforce_eager=True, trust_remote_code=True)
+    return [row[0] if row else "" for row in out] if n == 1 else out
 
 
 # MUST match question_filter/gen_answers_rm.py:SOLVER_SYS, so a --fresh_rejected

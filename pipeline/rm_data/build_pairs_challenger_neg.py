@@ -54,6 +54,11 @@ import sys
 import time
 from typing import Dict, List
 
+if __package__:
+    from .parallel_generate import generate
+else:
+    from parallel_generate import generate
+
 # MUST match question_filter/gen_answers_rm.py:SOLVER_SYS byte for byte, so the
 # challenger is fed the identical "as if asking the solver" context.
 SOLVER_SYS = (
@@ -150,47 +155,15 @@ def _coherence(s: str) -> float:
 
 # ---------------------------------------------------------------------------
 # vLLM generation helper, used for both the optional fresh solver answers and
-# the challenger-as-solver answers. Frees the model on return so two models can
-# run sequentially in one process (same pattern as build_pairs_subtask._vllm).
+# the challenger-as-solver answers. Shard generation, then select pairs globally.
 # ---------------------------------------------------------------------------
 
 def _vllm_generate(model_path: str, questions: List[str], *, n: int, seed: int,
                    max_tokens: int, temperature: float, top_p: float,
                    mem: float) -> List[List[str]]:
-    import vllm
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    llm = vllm.LLM(
-        model=model_path,
-        tokenizer=model_path,
-        gpu_memory_utilization=mem,
-        seed=int(seed),
-    )
-    sp = vllm.SamplingParams(
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stop_token_ids=[tokenizer.eos_token_id],
-        n=n,
-    )
-    chats = [
-        [{"role": "user", "content": q}]
-        for q in questions
-    ]
-    if tokenizer.chat_template:
-        prompts = [
-            tokenizer.apply_chat_template(
-                c, tokenize=False, add_generation_prompt=True,
-                add_special_tokens=True)
-            for c in chats
-        ]
-    else:
-        prompts = ["\n".join(f"{m['role']}: {m['content']}" for m in c)
-                   for c in chats]
-    responses = llm.generate(prompts, sampling_params=sp, use_tqdm=True)
-    out = [[o.text for o in r.outputs] for r in responses]
-    del llm
-    return out
+    chats = [[{"role": "user", "content": q}] for q in questions]
+    return generate(model_path, chats, seed=seed, mem=mem, n=n,
+                    max_tokens=max_tokens, temperature=temperature, top_p=top_p)
 
 
 # ---------------------------------------------------------------------------
