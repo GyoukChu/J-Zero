@@ -153,6 +153,9 @@ for DS in $DATASETS; do
     echo "[run_solver_eval]   $DS: merged $N records -> $MERGED"
     rm -f "${SHARDS[@]}"
 done
+# Marker for orchestrators (benchmarks/scripts/eval_standard/run_eval.sh):
+# generation has finished on every EVAL_GPU, so all but the judge GPU are free.
+touch "$OUT_DIR/.gen_done"
 
 # ---------------------------------------------------------------------------
 # Stage 2: LLM recheck (verl_mv base + LLM judge on the < 0.5 samples). The
